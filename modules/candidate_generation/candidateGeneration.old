@@ -1,0 +1,213 @@
+from datetime import datetime
+import numpy
+import pickle
+import pandas as pd
+import csv
+import logging
+
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.layers import Flatten
+from keras.layers import Dropout
+from keras.regularizers import l2
+from keras.optimizers import SGD, Adam
+from keras.models import load_model
+
+from sklearn.preprocessing import LabelBinarizer
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.utils import shuffle
+from sklearn.model_selection import StratifiedKFold
+
+import matplotlib.pyplot as plt
+
+class CandidateGeneration(object):
+
+    def __init__(self, userEmbeddingsFile, textualEmbeddingsFile, ratingsFile, outputModel,  epochs, description):
+        self.configureLogging()
+        self.logger = logging.getLogger('CandidateGeneration')
+        self.logger.info("********************")
+        self.logger.info("CANDIDATE GENERATION")
+        self.logger.info("********************")
+        self.logger.info(description)
+        self.logger.info("Begin Candidate Genearation")
+        self.logger.info("userEmbeddingsFile: " + userEmbeddingsFile)
+        self.logger.info("textualEmbeddingsFile: " + textualEmbeddingsFile)
+        self.logger.info("ratingsFile: " + ratingsFile)
+        self.logger.info("outputModel: " + outputModel)
+
+        self.textualEmbeddings = {}
+        self.dict_users = {}
+        self.userEmbeddingsFile = userEmbeddingsFile
+        self.textualEmbeddingsFile = textualEmbeddingsFile
+        self.ratingsFile = ratingsFile
+        self.outputModel = outputModel
+        self.lb = LabelBinarizer()
+        self.epochs = epochs        
+        self.description = description
+
+    def configureLogging(self):
+        logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(name)s %(levelname)-8s %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    filename='./logs/CandidateGeneration.log',
+                    filemode='a')
+        console = logging.StreamHandler()
+        console.setLevel(logging.INFO)
+        formatter = logging.Formatter('%(asctime)s %(name)-12s: %(levelname)-8s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        console.setFormatter(formatter)
+        logging.getLogger('').addHandler(console)
+
+    def openTextualEmbeddingsFile(self):
+        self.logger.info("Started openTextualEmbeddingsFile")
+        with open(self.textualEmbeddingsFile, 'rb') as f:
+            self.textualEmbeddings = pickle.load(f)
+        self.logger.info("Done openTextualEmbeddingsFile")
+    
+    def openUserEmbeddings(self):
+        self.logger.info("Started openUserEmbeddings")
+        with open(self.userEmbeddingsFile, 'rb') as u:
+            self.dict_users = pickle.load(u)
+        self.logger.info("Done openUserEmbeddings")
+
+    def openRatingsFile(self):
+        self.logger.info("Started openRatingsFile")
+        lst = []
+        with open(self.ratingsFile, newline='') as csvfile:
+            reader = csv.reader(csvfile, delimiter='\t', quotechar='|')
+            lst = list(reader)
+        
+        self.logger.info("Creating list of dense vectors")
+        ratings_list = []
+        for row in lst:
+            l = []
+            user_dense_vector = self.dict_users[row[0]]
+            l.append(row[0])
+            l.append(row[1])
+            l.append(row[2])
+            l.append(user_dense_vector)
+            ratings_list.append(l)
+
+        self.logger.info("Creating Dataframe")
+        df = pd.DataFrame(ratings_list)
+        df.columns = ['UserId', 'ProductId', 'Rating', 'UserVector']
+        df[['Rating']] = df[['Rating']].apply(pd.to_numeric)
+        
+        self.logger.info("Done openRatingsFile")
+        return df
+
+    def splitDataset(self, dataset):
+        self.logger.info("Started splitDataset")
+        # split into train and test
+        df = shuffle(dataset)
+        cutoff = int(0.8*len(df))
+        df_train = df.iloc[:cutoff]
+        df_test = df.iloc[cutoff:]
+        self.logger.info("Done splitDataset")
+        return df_train, df_test
+
+    def generateXY(self, dataset):
+        self.logger.info("Started generateXY")
+        X = []
+        Y = []
+        for index, row in dataset.iterrows():    
+            embeddings = numpy.append(self.textualEmbeddings[row['ProductId']], row['UserVector'])    
+            X.append(embeddings)
+            Y.append(row['Rating'])
+
+        
+        self.logger.info("Done generateXY")
+        return numpy.asarray(X), numpy.asarray(Y)
+
+    def binarizeOutput(self, Y):  
+        self.logger.info("Started binarizeOutput")
+        outputBinarized = self.lb.fit_transform(Y)
+        self.logger.info("Done binarizeOutput")
+        return outputBinarized
+
+    def defineModel(self):
+        self.logger.info("Started defineModel")
+        modelOptimizer = Adam(lr=0.001, beta_1=0.9, beta_2=0.999, epsilon=None, decay=0.0, amsgrad=False)
+        #modelOptimizer = SGD(lr=0.04, momentum=0.9)
+        model = Sequential()
+        model.add(Dense(600, input_shape=(600, ), activation='relu'))
+        model.add(Dropout(0.3))
+        model.add(Dense(60, kernel_initializer='normal', activation='relu'))
+        model.add(Dense(8, activation='relu'))
+        model.add(Dense(len(self.lb.classes_), activation="softmax"))
+        model.compile(loss='mse', optimizer=modelOptimizer, metrics=['mae', 'mse'])
+        self.logger.info(model.summary())
+        self.logger.info(modelOptimizer)
+        self.logger.info("Done defineModel")
+        return model
+
+    def runNeuralNetwork(self):
+        self.openTextualEmbeddingsFile()
+        self.openUserEmbeddings()
+        ratingsDataset = self.openRatingsFile()
+        
+        X, Y = self.generateXY(ratingsDataset) 
+        self.logger.info("Dataset size: " + str(len(X)))       
+        
+        kfold = StratifiedKFold(n_splits=10, shuffle=True)
+        meanScores = []         
+
+        for idx, (train, test) in enumerate(kfold.split(X, Y)):
+            Y_train = self.binarizeOutput(Y[train])
+            Y_test = self.binarizeOutput(Y[test])
+            model = self.defineModel()
+
+            self.logger.info("K-Fold: " + str(idx+1) + "/10")
+            H = model.fit(X[train], Y_train, validation_data=(X[test], Y_test), epochs=self.epochs, batch_size=32)
+
+            scores = model.evaluate(X[test], Y_test, verbose=0)
+            meanScores.append([scores[2], scores[1]])
+
+            self.logger.info("Evaluation from Neural Network")
+            self.logger.info("MSE: " + str(scores[2]))
+            self.logger.info("MAE: " + str(scores[1]))
+            self.logger.info(H.history.keys())
+
+            plt.plot(H.history['mean_squared_error'])
+            plt.plot(H.history['val_mean_squared_error'])
+            plt.title(self.description + " K-Fold: " + str(idx+1))
+            plt.ylabel("MSE")
+            plt.xlabel("Epoch")
+            plt.legend(["train", "test"], loc="upper left")
+            plt.savefig("./logs/" + self.description + "_" + str(datetime.now()).replace(":", "").replace(" ","").replace(".","") + "_" + str(idx+1) + ".png")
+            plt.cla()
+
+        self.logger.info("Mean MSE validation: " + str(numpy.mean(meanScores[0]) + " Standard Deviation: " + str(numpy.std(meanScores[0]))))
+        self.logger.info("Mean MAE validation: " + str(numpy.mean(meanScores[1]) + " Standard Deviation: " + str(numpy.std(meanScores[1]))))
+        model.save(self.outputModel)
+
+    def calculateMetrics(self):
+        self.logger.info("Started calculateMetrics")
+        self.openTextualEmbeddingsFile()
+        self.openUserEmbeddings()
+        ratingsDataset = self.openRatingsFile()
+        train, test = self.splitDataset(ratingsDataset)
+        X_train, Y_train = self.generateXY(train)
+        X_test, Y_test = self.generateXY(test)
+        Y_train = self.binarizeOutput(Y_train)
+        Y_test = self.binarizeOutput(Y_test)
+
+        self.logger.info("Load Model")
+        model = load_model(self.outputModel)
+
+        true_rating = numpy.array(Y_test)
+
+        predictions = model.predict(X_test)
+        
+        self.logger.info("Calculating metrics...")
+        mse = mean_squared_error(true_rating, predictions)
+        mae = mean_absolute_error(true_rating, predictions)
+        
+        self.logger.info("*****************************")
+        self.logger.info("CANDIDATE GENERATION RESULTS")
+        self.logger.info("*****************************")
+        self.logger.info(self.description)
+
+        self.logger.info("MSE: " + str(mse))
+        self.logger.info("MAE: " + str(mae))
+        print("MSE: ", mse)
+        print("MAE: ", mae)
